@@ -1,18 +1,22 @@
 import os
 import sys
+import time
 import threading
 import ctypes
 from pathlib import Path
 from ctypes import wintypes
 from datetime import datetime
 from collections import defaultdict
-from tkinter import filedialog, messagebox, ttk, Frame, Label, Scrollbar, Spinbox, StringVar, Menu, W, E, N, S, simpledialog
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tkinter import (filedialog, messagebox, ttk, Frame, Label, Scrollbar,
+                     Spinbox, StringVar, Menu, W, E, N, S, simpledialog)
 from lib.ImportCheck import import_PIL
 from lib.ConfirmationDialog import ConfirmationDialog
 from lib.ThumbnailViewerWindow import ThumbnailViewerWindow
 from lib.i18n import I18N_STRINGS
 
 Image, ImageTk = import_PIL()
+
 
 class QQCleanerApp:
     def __init__(self, root):
@@ -26,15 +30,18 @@ class QQCleanerApp:
         self.setup_ui()
         self.update_ui_language()
 
-    def _(self, key, *args):
+    # ------------------------------------------------------------------ i18n
+    # Fix #8: support **kwargs so both positional and keyword formats work
+    def _(self, key, *args, **kwargs):
         """Simple text translation helper."""
-        return I18N_STRINGS[self.lang].get(key, key).format(*args)
+        return I18N_STRINGS[self.lang].get(key, key).format(*args, **kwargs)
 
     def set_language(self, lang_code):
         """Set the application language and update UI."""
         self.lang = lang_code
         self.update_ui_language()
 
+    # ------------------------------------------------------------------ UI
     def setup_ui(self):
         """Initialize the GUI application."""
         # --- Menu Bar ---
@@ -44,7 +51,7 @@ class QQCleanerApp:
         menubar.add_cascade(label=self._('language_menu'), menu=language_menu)
         language_menu.add_command(label="中文", command=lambda: self.set_language('zh'))
         language_menu.add_command(label="English", command=lambda: self.set_language('en'))
-        
+
         self.root.minsize(600, 450)
 
         top_frame = Frame(self.root, padx=10, pady=10)
@@ -52,11 +59,12 @@ class QQCleanerApp:
 
         self.folder_label = Label(top_frame)
         self.folder_label.pack(side='left')
-        ttk.Entry(top_frame, textvariable=self.root_path, state='readonly').pack(side='left', fill='x', expand=True, padx=5)
-        
+        ttk.Entry(top_frame, textvariable=self.root_path, state='readonly').pack(
+            side='left', fill='x', expand=True, padx=5)
+
         self.auto_select_button = ttk.Button(top_frame, command=self.auto_select_folder)
         self.auto_select_button.pack(side='left', padx=(0, 5))
-        
+
         self.select_folder_button = ttk.Button(top_frame, command=self.select_folder)
         self.select_folder_button.pack(side='left')
 
@@ -66,8 +74,8 @@ class QQCleanerApp:
         self.tree = ttk.Treeview(mid_frame, columns=('month', 'size', 'count'), show='headings')
         vsb = Scrollbar(mid_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.grid(row=0, column=0, sticky=N+S+W+E)
-        vsb.grid(row=0, column=1, sticky=N+S)
+        self.tree.grid(row=0, column=0, sticky=N + S + W + E)
+        vsb.grid(row=0, column=1, sticky=N + S)
         self.tree.bind("<Double-1>", self.on_tree_double_click)
         mid_frame.grid_rowconfigure(0, weight=1)
         mid_frame.grid_columnconfigure(0, weight=1)
@@ -84,9 +92,11 @@ class QQCleanerApp:
         self.year_spinbox.pack(side='left')
         self.month_spinbox = Spinbox(bottom_frame, from_=1, to=12, width=4)
         self.month_spinbox.pack(side='left', padx=5)
-        self.year_spinbox.delete(0, 'end'); self.year_spinbox.insert(0, str(datetime.now().year))
-        self.month_spinbox.delete(0, 'end'); self.month_spinbox.insert(0, str(datetime.now().month))
-        
+        self.year_spinbox.delete(0, 'end')
+        self.year_spinbox.insert(0, str(datetime.now().year))
+        self.month_spinbox.delete(0, 'end')
+        self.month_spinbox.insert(0, str(datetime.now().month))
+
         self.delete_button = ttk.Button(bottom_frame, command=self.start_delete, state='disabled')
         self.delete_button.pack(side='left', padx=5)
 
@@ -101,26 +111,26 @@ class QQCleanerApp:
         """Update all text elements in the UI to the current language."""
         self.root.title(self._('window_title'))
         self.root.nametowidget(self.root.cget('menu')).entryconfig(1, label=self._('language_menu'))
-        
+
         self.folder_label.config(text=self._('folder_label'))
         self.select_folder_button.config(text=self._('select_folder_btn'))
         self.auto_select_button.config(text=self._('auto_select_folder_btn'))
         self.scan_button.config(text=self._('scan_files_btn'))
         self.delete_label.config(text=self._('delete_prompt'))
         self.delete_button.config(text=self._('delete_files_btn'))
-        
+
         self.tree.heading('month', text=self._('tree_month'))
         self.tree.heading('size', text=self._('tree_size'))
         self.tree.heading('count', text=self._('tree_count'))
 
         if not self.root_path.get():
             self.status_label.config(text=self._('status_select_folder'))
-        
+
         # Redraw treeview with translated strings if data exists
         if self.file_data:
             self.update_treeview()
 
-
+    # ------------------------------------------------------------------ folder
     def select_folder(self):
         """Open a dialog to select the root folder."""
         path = filedialog.askdirectory(title="Select the QQ Group folder")
@@ -129,34 +139,38 @@ class QQCleanerApp:
 
     def auto_select_folder(self):
         """Try to automatically find the QQ Group folder."""
-        qq_number = simpledialog.askstring(self._('qq_number_title'), self._('prompt_qq_number'), parent=self.root)
+        qq_number = simpledialog.askstring(
+            self._('qq_number_title'), self._('prompt_qq_number'), parent=self.root)
         if not qq_number or not qq_number.isdigit():
             return
 
         documents_path = self.get_documents_path()
         if not documents_path:
-              messagebox.showwarning(self._('error_find_qq_folder_title'), "Could not determine the Documents folder path.")
-              return
+            messagebox.showwarning(
+                self._('error_find_qq_folder_title'),
+                "Could not determine the Documents folder path.")
+            return
 
         qq_folder_path = Path(documents_path) / 'Tencent Files' / qq_number / 'Image' / 'Group2'
 
         if qq_folder_path.is_dir():
             self.set_folder_path(str(qq_folder_path))
         else:
-            messagebox.showwarning(self._('error_find_qq_folder_title'), self._('error_find_qq_folder_msg'))
+            messagebox.showwarning(
+                self._('error_find_qq_folder_title'),
+                self._('error_find_qq_folder_msg'))
 
     def get_documents_path(self):
         """Get the user's Documents folder path reliably on Windows."""
         if sys.platform == 'win32':
-            # These modules are now imported at the top of the file
             CSIDL_PERSONAL = 5       # My Documents
             SHGFP_TYPE_CURRENT = 0   # Get current, not default value
 
             buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
-            ctypes.windll.shell32.SHGetFolderPathW(None, CSIDL_PERSONAL, None, SHGFP_TYPE_CURRENT, buf)
+            ctypes.windll.shell32.SHGetFolderPathW(
+                None, CSIDL_PERSONAL, None, SHGFP_TYPE_CURRENT, buf)
             return buf.value
         else:
-            # Fallback for non-Windows systems
             return str(Path.home() / 'Documents')
 
     def set_folder_path(self, path):
@@ -168,89 +182,93 @@ class QQCleanerApp:
         self.file_data.clear()
         self.update_treeview()
 
+    # ------------------------------------------------------------------ scan
     def start_scan(self):
         """Start the file scanning process in a new thread."""
         if not self.root_path.get():
             messagebox.showerror(self._('error_title'), self._('error_no_folder'))
             return
-        
+
         self.scan_button.config(state='disabled')
         self.delete_button.config(state='disabled')
         self.status_label.config(text=self._('status_scanning'))
-        
-        # Switch to determinate progress bar
+
         self.progress.stop()
         self.progress.config(mode='determinate', value=0)
-        
+
         threading.Thread(target=self.scan_thread, daemon=True).start()
 
     def scan_thread(self):
-        """Optimized scanning logic using os.scandir."""
+        """Optimized scanning logic using os.scandir with iterative traversal."""
         self.file_data.clear()
         path_to_scan = self.root_path.get()
-        
-        # --- 关键修复 2: 增强错误捕获和报告 ---
-        # 使用更广泛的 except Exception as e 来捕获所有可能的错误
-        # 并使用 print() 将错误信息输出到控制台，以便调试
+
         print(f"Starting scan on: {path_to_scan}")
 
         try:
-            # --- Progress Estimation ---
             all_entries = list(os.scandir(path_to_scan))
             total_entries = len(all_entries)
             print(f"Found {total_entries} top-level entries.")
-            self.root.after(0, lambda: self.progress.config(maximum=total_entries if total_entries > 0 else 1))
+            self.root.after(0, lambda: self.progress.config(
+                maximum=total_entries if total_entries > 0 else 1))
         except Exception as e:
             print(f"!!! FATAL ERROR: Could not list directory '{path_to_scan}'.")
             print(f"!!! REASON: {e}")
             import traceback
-            traceback.print_exc() # 打印完整的错误堆栈
+            traceback.print_exc()
             self.root.after(0, self.finish_scan)
             return
 
         def process_file(entry):
-            """Processes a single file entry to avoid code duplication."""
+            """Processes a single file entry."""
             try:
                 stat = entry.stat()
-                # 使用 st_mtime 作为统一的时间戳来源，因为它最可靠
-                file_time = stat.st_mtime
+                # Fix #7: use min(ctime, mtime, atime) as the "real time"
+                file_time = min(stat.st_ctime, stat.st_mtime, stat.st_atime)
                 file_size = stat.st_size
-                
-                dt_object = datetime.fromtimestamp(file_time)
-                year, month = dt_object.year, dt_object.month
-                
+
+                # Fix #2: use time.localtime instead of datetime.fromtimestamp
+                local_time = time.localtime(file_time)
+                year, month = local_time.tm_year, local_time.tm_mon
+
                 self.file_data[year][month]['size'] += file_size
                 self.file_data[year][month]['paths'].append(entry.path)
             except Exception as e:
-                # 如果单个文件处理失败，打印警告但继续运行
                 print(f"--- WARNING: Could not process file '{entry.path}'. Reason: {e}")
-                
-        def recursive_scan(path):
-            try:
-                for entry in os.scandir(path):
-                    if entry.is_dir(follow_symlinks=False):
-                        recursive_scan(entry.path)
-                    elif entry.is_file(follow_symlinks=False):
-                        process_file(entry)
-            except Exception as e:
-                print(f"--- WARNING: Could not scan sub-directory '{path}'. Reason: {e}")
 
-        # --- Main Scan Loop ---
+        # Fix #10: iterative (stack-based) traversal instead of recursion
+        # Fix #3: throttle UI updates to ~10 per second
+        last_update_time = time.time()
         try:
             for i, entry in enumerate(all_entries):
                 try:
                     if entry.is_dir(follow_symlinks=False):
-                        recursive_scan(entry.path)
+                        # --- Iterative directory traversal using a stack ---
+                        stack = [entry.path]
+                        while stack:
+                            current_path = stack.pop()
+                            try:
+                                for sub_entry in os.scandir(current_path):
+                                    if sub_entry.is_dir(follow_symlinks=False):
+                                        stack.append(sub_entry.path)
+                                    elif sub_entry.is_file(follow_symlinks=False):
+                                        process_file(sub_entry)
+                            except Exception as e:
+                                print(
+                                    f"--- WARNING: Could not scan sub-directory "
+                                    f"'{current_path}'. Reason: {e}")
                     elif entry.is_file(follow_symlinks=False):
                         process_file(entry)
                 finally:
-                    # Update progress after processing each top-level entry
-                    self.root.after(0, lambda i=i: self.progress.config(value=i + 1))
+                    now = time.time()
+                    if now - last_update_time > 0.1 or (i + 1) == total_entries:
+                        last_update_time = now
+                        self.root.after(
+                            0, lambda i=i: self.progress.config(value=i + 1))
         finally:
             print("Scan loop finished.")
-            # Final call to ensure GUI is updated after the loop finishes
             self.root.after(0, self.finish_scan)
-    
+
     def finish_scan(self):
         """Update the GUI after the scan is complete."""
         self.progress.stop()
@@ -270,21 +288,24 @@ class QQCleanerApp:
 
         sorted_years = sorted(self.file_data.keys(), reverse=True)
         for year in sorted_years:
-            year_node = self.tree.insert('', 'end', values=(self._('year_prefix', year), "", ""), open=True)
+            year_node = self.tree.insert(
+                '', 'end', values=(self._('year_prefix', year), "", ""), open=True)
             sorted_months = sorted(self.file_data[year].keys(), reverse=True)
             for month in sorted_months:
                 data = self.file_data[year][month]
                 size_mb = round(data['size'] / (1024 * 1024), 2)
                 file_count = len(data['paths'])
-                # Store year and month in the item's tags for later retrieval
-                item_id = self.tree.insert(year_node, 'end', values=(f"  └ {month:02d}", f"{size_mb:,.2f}", f"{file_count:,}"))
+                item_id = self.tree.insert(
+                    year_node, 'end',
+                    values=(f"  └ {month:02d}", f"{size_mb:,.2f}", f"{file_count:,}"))
                 self.tree.item(item_id, tags=(str(year), str(month)))
 
     def on_tree_double_click(self, event):
         """Handle double-click event on the treeview to open thumbnail viewer."""
         item_id = self.tree.focus()
-        if not item_id: return
-        
+        if not item_id:
+            return
+
         item = self.tree.item(item_id)
         tags = item.get('tags')
 
@@ -297,6 +318,7 @@ class QQCleanerApp:
             except (ValueError, IndexError):
                 print(f"Could not parse year/month from tags: {tags}")
 
+    # ------------------------------------------------------------------ delete
     def start_delete(self):
         """Confirm and start the deletion process."""
         try:
@@ -309,48 +331,71 @@ class QQCleanerApp:
         paths_to_delete = []
         image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.bmp')
         image_paths_to_preview = []
-        
+
         for year, months in self.file_data.items():
             for month, data in months.items():
                 if year < target_year or (year == target_year and month <= target_month):
                     paths_to_delete.extend(data['paths'])
-                    # Collect image paths for preview
                     for path in data['paths']:
                         if path.lower().endswith(image_extensions):
                             image_paths_to_preview.append(path)
-        
+
         if not paths_to_delete:
             self.status_label.config(text="No files to delete for the selected period.")
             return
 
-        dialog = ConfirmationDialog(self.root, self, target_year, target_month, image_paths_to_preview)
+        dialog = ConfirmationDialog(
+            self.root, self, target_year, target_month, image_paths_to_preview)
         self.root.wait_window(dialog.top)
 
         if dialog.confirmed:
             self.scan_button.config(state='disabled')
             self.delete_button.config(state='disabled')
-            self.status_label.config(text=self._('status_deleting', '0', len(paths_to_delete)))
-            threading.Thread(target=self.delete_thread, args=(paths_to_delete,), daemon=True).start()
+            self.status_label.config(
+                text=self._('status_deleting', '0', len(paths_to_delete)))
+            threading.Thread(
+                target=self.delete_thread, args=(paths_to_delete,),
+                daemon=True).start()
         else:
             self.status_label.config(text=self._('status_deletion_cancelled'))
 
+    # Fix #1: multi-threaded deletion with ThreadPoolExecutor(max_workers=8)
     def delete_thread(self, paths_to_delete):
-        """The actual deletion logic that runs in the background."""
+        """The actual deletion logic that runs in the background with multi-threading."""
         total_files = len(paths_to_delete)
-        deleted_count, error_count = 0, 0
-        
+        deleted_count = 0
+        error_count = 0
+        completed = 0
+
         self.root.after(0, lambda: self.progress.config(maximum=total_files, value=0))
 
-        for i, path in enumerate(paths_to_delete):
+        def delete_one(path):
+            """Delete a single file. Returns True on success, False on failure."""
             try:
                 os.remove(path)
-                deleted_count += 1
+                return True
             except (OSError, PermissionError) as e:
                 print(f"Could not delete {path}: {e}")
-                error_count += 1
-            
-            if (i + 1) % 50 == 0 or (i + 1) == total_files:
-                self.root.after(0, lambda i=i: self.update_delete_progress(i + 1, total_files))
+                return False
+
+        last_update_time = time.time()
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(delete_one, path) for path in paths_to_delete]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    deleted_count += 1
+                else:
+                    error_count += 1
+                completed += 1
+
+                # Throttle UI updates to ~10 per second
+                now = time.time()
+                if now - last_update_time > 0.1 or completed == total_files:
+                    last_update_time = now
+                    self.root.after(
+                        0, lambda c=completed: self.update_delete_progress(c, total_files))
 
         self.root.after(0, lambda: self.finish_delete(deleted_count, error_count))
 
@@ -360,6 +405,7 @@ class QQCleanerApp:
 
     def finish_delete(self, deleted_count, error_count):
         """Update the GUI after deletion is complete."""
-        self.status_label.config(text=self._('status_delete_complete', deleted_count, error_count))
+        self.status_label.config(
+            text=self._('status_delete_complete', deleted_count, error_count))
         self.progress['value'] = 0
         self.start_scan()

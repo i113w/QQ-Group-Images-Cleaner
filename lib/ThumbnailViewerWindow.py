@@ -191,7 +191,9 @@ class ThumbnailViewerWindow:
         for path in image_paths:
             try:
                 stat = os.stat(path)
-                temp_list.append({'path': path, 'size': stat.st_size, 'time': stat.st_mtime})
+                # Fix #7: use min(ctime, mtime, atime) as the "real time"
+                real_time = min(stat.st_ctime, stat.st_mtime, stat.st_atime)
+                temp_list.append({'path': path, 'size': stat.st_size, 'time': real_time})
             except FileNotFoundError:
                 continue
         self.all_images = temp_list
@@ -220,6 +222,7 @@ class ThumbnailViewerWindow:
 
         if force_reload:
             self.photo_references.clear()
+
         # Per-page widget dicts are rebuilt in populate_thumbnails
         self.thumb_labels.clear()
         self.thumb_vars.clear()
@@ -239,32 +242,79 @@ class ThumbnailViewerWindow:
         end_index = start_index + per_page
         self.images_on_page = self.all_images[start_index:end_index]
 
+        # --- Fix #5: prevent memory leak ---
+        # Remove PhotoImage references that no longer belong to the current page.
+        current_page_paths = set(img['path'] for img in self.images_on_page)
+        paths_to_remove = [p for p in list(self.photo_references.keys())
+                           if p not in current_page_paths]
+        for p in paths_to_remove:
+            del self.photo_references[p]
+
         self.update_page_controls()
 
         if self.images_on_page:
-            if force_reload:
+            missing = [img for img in self.images_on_page
+                       if img['path'] not in self.photo_references]
+            if missing:
                 threading.Thread(target=self._load_thumbnails_thread,
-                                 args=(self.images_on_page,), daemon=True).start()
+                                 args=(missing, self.images_on_page),
+                                 daemon=True).start()
             else:
                 self.populate_thumbnails(self.images_on_page)
 
-    def _load_thumbnails_thread(self, image_data):
-        """Load thumbnail images in the background."""
+    # --- Fix #4: thread-safe thumbnail loading ---
+    # Worker thread only does Image.open() / thumbnail() (PIL operations).
+    # ImageTk.PhotoImage instantiation happens in the main thread via after().
+    def _load_thumbnails_thread(self, image_data, full_page_data=None):
+        """Load thumbnail images in the background (PIL only — thread-safe).
+
+        Only ``Image.open()`` and ``thumbnail()`` are called here.
+        ``ImageTk.PhotoImage`` instantiation is deferred to the main
+        thread via ``after()`` to keep Tkinter thread-safe.
+        """
         for data in image_data:
             path = data['path']
-            if path in self.photo_references:
-                continue
             try:
                 image = Image.open(path)
                 image.thumbnail((150, 150))
-                photo = ImageTk.PhotoImage(image)
-                self.photo_references[path] = photo
+                # Send PIL Image to main thread for PhotoImage creation
+                self.top.after(0, self._create_photo_image, path, image)
             except Exception as e:
                 print(f"Error loading thumbnail for {path}: {e}")
-        self.top.after(0, lambda: self.populate_thumbnails(image_data))
+        # After all PhotoImages are queued, populate the view in main thread
+        target_data = full_page_data if full_page_data is not None else image_data
+        self.top.after(0, lambda: self.populate_thumbnails(target_data))
+
+    def _create_photo_image(self, path, pil_image):
+        """Create ImageTk.PhotoImage in the main thread (thread-safe)."""
+        if not self.top.winfo_exists():
+            try:
+                pil_image.close()
+            except Exception:
+                pass
+            return
+        if path in self.photo_references:
+            try:
+                pil_image.close()
+            except Exception:
+                pass
+            return
+        try:
+            photo = ImageTk.PhotoImage(pil_image)
+            self.photo_references[path] = photo
+        except Exception as e:
+            print(f"Error creating PhotoImage for {path}: {e}")
+        finally:
+            try:
+                pil_image.close()
+            except Exception:
+                pass
 
     def populate_thumbnails(self, image_data):
         """Place loaded thumbnails onto the canvas in a fixed grid."""
+        if not self.top.winfo_exists():
+            return
+
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.thumb_labels.clear()
@@ -314,14 +364,16 @@ class ThumbnailViewerWindow:
         """Update the state of pagination buttons, entry, and label."""
         has_multiple_pages = self.total_pages > 1
         self.total_pages_label.config(text=self.app._('page_count_suffix', self.total_pages))
-        
-        self.page_entry.config(state='normal') # Temporarily enable to update text
+
+        self.page_entry.config(state='normal')  # Temporarily enable to update text
         self.page_entry.delete(0, 'end')
         self.page_entry.insert(0, str(self.current_page))
         self.page_entry.config(state='normal' if has_multiple_pages else 'disabled')
-        
-        self.prev_button.config(state='normal' if (has_multiple_pages and self.current_page > 1) else 'disabled')
-        self.next_button.config(state='normal' if (has_multiple_pages and self.current_page < self.total_pages) else 'disabled')
+
+        self.prev_button.config(
+            state='normal' if (has_multiple_pages and self.current_page > 1) else 'disabled')
+        self.next_button.config(
+            state='normal' if (has_multiple_pages and self.current_page < self.total_pages) else 'disabled')
 
     def change_page(self, delta):
         """Navigate to the previous or next page."""
@@ -564,6 +616,8 @@ class ThumbnailViewerWindow:
         self._update_delete_button_text()
 
     # ============================================================ Deletion
+    # Fix #6: decouple file deletion from UI cleanup so that a failed
+    # deletion does not corrupt in-memory data structures.
     def delete_selected_images(self):
         """Delete all selected images (checkbox + rubber-band) after confirmation."""
         if not self.selected_paths:
@@ -591,18 +645,19 @@ class ThumbnailViewerWindow:
 
         deleted_count = 0
         error_count = 0
-        delete_set = set(paths_to_delete)
+        deleted_paths = set()
 
         for path in paths_to_delete:
             try:
                 os.remove(path)
                 deleted_count += 1
+                deleted_paths.add(path)
             except Exception as e:
                 print(f"Could not delete {path}: {e}")
                 error_count += 1
 
-        # Clean up all references
-        for path in paths_to_delete:
+        # Clean up references ONLY for successfully deleted files
+        for path in deleted_paths:
             self.selected_paths.discard(path)
             self.thumb_vars.pop(path, None)
             if path in self.thumb_frames:
@@ -619,9 +674,9 @@ class ThumbnailViewerWindow:
             except (KeyError, ValueError):
                 pass
 
-        # Update image lists
+        # Update image lists — only remove successfully deleted files
         self.all_images = [img for img in self.all_images
-                           if img['path'] not in delete_set]
+                           if img['path'] not in deleted_paths]
 
         # Recalculate pagination
         try:
@@ -643,8 +698,9 @@ class ThumbnailViewerWindow:
         )
 
     # ---------------------------------------------------- Single-file delete (right-click)
+    # Fix #6: if os.remove fails, return early without touching UI state.
     def delete_image(self):
-        """Right-click → Delete (behavior unchanged, plus cleanup of new structures)."""
+        """Right-click → Delete (with proper exception handling)."""
         path = self.clicked_image_path
         if not path:
             return
@@ -653,28 +709,39 @@ class ThumbnailViewerWindow:
                 self.app._('confirm_delete_title'),
                 f"确认删除文件?\n{os.path.basename(path)}",
                 parent=self.top):
+            # --- Step 1: attempt file deletion ---
             try:
                 os.remove(path)
-                self.thumb_labels[path].master.destroy()
-                del self.thumb_labels[path]
-                # Clean up new structures
-                self.selected_paths.discard(path)
-                self.thumb_vars.pop(path, None)
-                self.thumb_frames.pop(path, None)
-                self.photo_references.pop(path, None)
-
-                self.all_images = [img for img in self.all_images
-                                   if img['path'] != path]
-                self.images_on_page = [img for img in self.images_on_page
-                                       if img['path'] != path]
-
-                self.populate_thumbnails(self.images_on_page)
-                self.update_page_controls()
-
-                self.app.file_data[self.year][self.month]['paths'].remove(path)
             except Exception as e:
                 messagebox.showerror(self.app._('error_title'),
                                      f"删除失败: {e}", parent=self.top)
+                return  # deletion failed — do NOT modify UI or data
+
+            # --- Step 2: deletion succeeded — safely clean up UI & data ---
+            try:
+                if path in self.thumb_labels:
+                    self.thumb_labels[path].master.destroy()
+                    del self.thumb_labels[path]
+            except Exception:
+                pass
+
+            self.selected_paths.discard(path)
+            self.thumb_vars.pop(path, None)
+            self.thumb_frames.pop(path, None)
+            self.photo_references.pop(path, None)
+
+            self.all_images = [img for img in self.all_images
+                               if img['path'] != path]
+            self.images_on_page = [img for img in self.images_on_page
+                                   if img['path'] != path]
+
+            self.populate_thumbnails(self.images_on_page)
+            self.update_page_controls()
+
+            try:
+                self.app.file_data[self.year][self.month]['paths'].remove(path)
+            except (KeyError, ValueError):
+                pass
 
     def open_image(self):
         if self.clicked_image_path:
