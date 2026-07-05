@@ -43,7 +43,12 @@ I18N_STRINGS = {
         'context_open': "打开",
         'context_open_dir': "打开所在目录",
         'prev_page': "上一页",
-        'next_page': "下一页"
+        'next_page': "下一页",
+        'delete_selected_btn': "删除选中",
+        'delete_selected_btn_with_count': "删除选中 ({})",
+        'no_selection_msg': "请先选择要删除的图片",
+        'confirm_selected_delete_msg': "您确定要永久删除选中的 {} 个文件吗？\n\n此操作无法撤销。\n\n以下是待删除图片的部分随机预览：",
+        'selection_hint': "提示：左键拖拽框选多个缩略图，右键拖拽取消选择，或点击缩略图右上角勾选框"
     },
     'en': {
         'window_title': "QQ Group Images Cleaner",
@@ -88,6 +93,11 @@ I18N_STRINGS = {
         'context_open': "Open",
         'context_open_dir': "Open Containing Folder",
         'prev_page': "Prev",
-        'next_page': "Next"
+        'next_page': "Next",
+        'delete_selected_btn': "Delete Selected",
+        'delete_selected_btn_with_count': "Delete Selected ({})",
+        'no_selection_msg': "Please select images first.",
+        'confirm_selected_delete_msg': "Are you sure you want to permanently delete {} selected files?\n\nThis action CANNOT be undone.\n\nA random sample of images to be deleted is shown below:",
+        'selection_hint': 'Tip: Left-drag to box-select, right-drag to deselect, or check the box at the top-right of each thumbnail'
     }
 }

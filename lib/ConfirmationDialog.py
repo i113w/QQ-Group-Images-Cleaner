@@ -8,7 +8,7 @@ Image, ImageTk = import_PIL()
 
 class ConfirmationDialog:
     """A custom dialog to confirm deletion with image previews."""
-    def __init__(self, parent, app, year, month, image_paths):
+    def __init__(self, parent, app, year, month, image_paths, custom_message=None):
         self.parent = parent
         self.app = app
         self.confirmed = False
@@ -19,7 +19,9 @@ class ConfirmationDialog:
         self.top.grab_set()
 
         # Message
-        if self.app.lang == 'zh':
+        if custom_message:
+            msg = custom_message
+        elif self.app.lang == 'zh':
             msg = self.app._('confirm_delete_msg', year, month)
         else:
             msg = self.app._('confirm_delete_msg', year=year, month=month)
@@ -40,7 +42,7 @@ class ConfirmationDialog:
         self.canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        self.photo_references = [] # IMPORTANT: Keep reference to avoid garbage collection
+        self.photo_references = []
         self.load_thumbnails(image_paths)
 
         # Buttons
@@ -52,12 +54,12 @@ class ConfirmationDialog:
     def load_thumbnails(self, image_paths):
         """Load a sample of images and display them."""
         sample_size = 20
-        paths_to_show = random.sample(image_paths, min(len(image_paths), sample_size))
+        paths_to_show = random.sample(image_paths, min(len(image_paths), sample_size)) if image_paths else []
         
         for i, path in enumerate(paths_to_show):
             try:
                 image = Image.open(path)
-                image.thumbnail((100, 100)) # Resize in-place
+                image.thumbnail((100, 100))
                 photo = ImageTk.PhotoImage(image)
                 self.photo_references.append(photo)
 
@@ -68,7 +70,6 @@ class ConfirmationDialog:
                 img_label = Label(item_frame, image=photo)
                 img_label.pack()
                 
-                # Show filename as a tooltip
                 ToolTip(img_label, os.path.basename(path))
 
             except Exception as e:
