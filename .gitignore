@@ -1,1 +1,6 @@
 lib/__pycache__
+
+/*.py
+!/qq_group_images_cleaner.py
+/*.md
+!/README.md
