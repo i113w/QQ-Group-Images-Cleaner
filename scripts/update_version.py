@@ -12,6 +12,7 @@ Example:
 import re
 import sys
 from pathlib import Path
+from typing import Union
 
 
 def parse_version_tuple(version: str) -> str:
@@ -22,7 +23,7 @@ def parse_version_tuple(version: str) -> str:
     # 去掉 pre-release / build 后缀 (例如 1.2.3-beta, 1.2.3+build5)
     base = re.split(r"[-+]", version, maxsplit=1)[0]
     parts = base.split(".")
-    int_parts: list[int] = []
+    int_parts = []
     for p in parts[:4]:
         try:
             int_parts.append(int(p))
@@ -33,7 +34,7 @@ def parse_version_tuple(version: str) -> str:
     return ", ".join(str(x) for x in int_parts)
 
 
-def update_version_file(version: str, file_path: str | Path = "version.txt") -> None:
+def update_version_file(version: str, file_path: Union[str, Path] = "version.txt") -> None:
     file_path = Path(file_path)
     ver_tuple = parse_version_tuple(version)
 
