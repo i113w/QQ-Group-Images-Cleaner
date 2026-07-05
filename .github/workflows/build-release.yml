@@ -5,51 +5,61 @@ name: Build and Release EXE
 on:
   push:
     tags:
-      - 'QQ-Group-Images-Cleaner-v*' # <--- 已更新！匹配新的标签格式
+      - 'i113w-v*'
 
-# 工作流中运行的任务 (jobs)
 jobs:
   build-windows:
-    # 指定运行此任务的虚拟机环境
     runs-on: windows-latest
 
-    # 关键修复1：为任务授予创建Release的权限
     permissions:
-      contents: write # <--- 新增！这是解决403权限错误的关键
+      contents: write
 
-    # 任务的步骤
     steps:
-      # 第一步：检出 (Checkout) 代码
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 第二步：设置 Python 环境
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
-      # 第三步：安装依赖
+      # 修改2：从专属 tag 中提取版本号
+      # tag 形如: i113w-v1.1.3  ->  version = 1.1.3
+      # tag 形如: i113w-v1.1.3-i113w.1  ->  version = 1.1.3-i113w.1
+      - name: Extract version from tag and update version.txt
+        shell: bash
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG_NAME#i113w-v}"
+          echo "Tag:     $TAG_NAME"
+          echo "Version: $VERSION"
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Failed to extract version from tag '$TAG_NAME'"
+            exit 1
+          fi
+          python scripts/update_version.py "$VERSION" version.txt
+          echo "----- version.txt after update -----"
+          cat version.txt
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # 第四步：使用 PyInstaller 打包
+      # 修改3：打包时给 exe 加上专属命名，避免和原作者重名
       - name: Build executable with PyInstaller
         run: >
           pyinstaller
           --noconfirm
           --onefile
           --windowed
-          --name "QQ-Group-Images-Cleaner"
+          --name "QQ-Group-Images-Cleaner-i113w"
           --version-file version.txt
           qq_group_images_cleaner.py
       
-      # 第五步：创建 Release 并上传打包好的文件
       - name: Create Release and Upload Asset
         uses: softprops/action-gh-release@v2
         with:
-          # files: 指定要上传的文件路径
-          files: dist/QQ-Group-Images-Cleaner.exe
+          # 修改4：上传的文件名也要对应修改
+          files: dist/QQ-Group-Images-Cleaner-i113w.exe
