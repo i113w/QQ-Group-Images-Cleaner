@@ -98,8 +98,17 @@ class ThumbnailViewerWindow:
         sort_menu.pack(side='left')
         sort_menu.bind('<<ComboboxSelected>>', self.sort_and_update)
 
-        self.page_label = Label(control_frame, text="")
-        self.page_label.pack(side='right', padx=10)
+        # --- Pagination controls (right side) ---
+        self.total_pages_label = Label(control_frame, text="")
+        self.total_pages_label.pack(side='right', padx=10)
+
+        self.page_entry = ttk.Entry(control_frame, width=5, justify='center')
+        self.page_entry.pack(side='right')
+        self.page_entry.bind("<Return>", self.on_goto_page)
+
+        self.goto_label = Label(control_frame, text=self.app._('goto_page'))
+        self.goto_label.pack(side='right', padx=(10, 2))
+
         self.next_button = ttk.Button(control_frame, text=self.app._('next_page'),
                                       command=lambda: self.change_page(1))
         self.next_button.pack(side='right')
@@ -126,18 +135,14 @@ class ThumbnailViewerWindow:
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
         # --- Rubber-band selection bindings (left-click → select) ---
-        # Press: bound to canvas / scrollable_frame / each thumbnail Label
         self.canvas.bind("<ButtonPress-1>", self.on_rubber_band_press)
         self.scrollable_frame.bind("<ButtonPress-1>", self.on_rubber_band_press)
-        # Motion & release: bind_all so we keep tracking even over child widgets
         self.canvas.bind_all("<B1-Motion>", self.on_rubber_band_drag)
         self.canvas.bind_all("<ButtonRelease-1>", self.on_rubber_band_release)
 
         # --- Rubber-band deselection bindings (right-click → deselect) ---
-        # Press: bound to canvas / scrollable_frame / each thumbnail Label
         self.canvas.bind("<ButtonPress-3>", self.on_right_rubber_band_press)
         self.scrollable_frame.bind("<ButtonPress-3>", self.on_right_rubber_band_press)
-        # Motion & release: bind_all so we keep tracking even over child widgets
         self.canvas.bind_all("<B3-Motion>", self.on_right_rubber_band_drag)
         self.canvas.bind_all("<ButtonRelease-3>", self.on_right_rubber_band_release)
 
@@ -306,10 +311,17 @@ class ThumbnailViewerWindow:
         self._update_delete_button_text()
 
     def update_page_controls(self):
-        """Update the state of pagination buttons and label."""
-        self.page_label.config(text=self.app._('page_label', self.current_page, self.total_pages))
-        self.prev_button.config(state='normal' if self.current_page > 1 else 'disabled')
-        self.next_button.config(state='normal' if self.current_page < self.total_pages else 'disabled')
+        """Update the state of pagination buttons, entry, and label."""
+        has_multiple_pages = self.total_pages > 1
+        self.total_pages_label.config(text=self.app._('page_count_suffix', self.total_pages))
+        
+        self.page_entry.config(state='normal') # Temporarily enable to update text
+        self.page_entry.delete(0, 'end')
+        self.page_entry.insert(0, str(self.current_page))
+        self.page_entry.config(state='normal' if has_multiple_pages else 'disabled')
+        
+        self.prev_button.config(state='normal' if (has_multiple_pages and self.current_page > 1) else 'disabled')
+        self.next_button.config(state='normal' if (has_multiple_pages and self.current_page < self.total_pages) else 'disabled')
 
     def change_page(self, delta):
         """Navigate to the previous or next page."""
@@ -317,6 +329,25 @@ class ThumbnailViewerWindow:
         if 1 <= new_page <= self.total_pages:
             self.current_page = new_page
             self.update_view()
+
+    def on_goto_page(self, event=None):
+        """Handle page jump when user presses Enter in the page entry."""
+        try:
+            target_page = int(self.page_entry.get())
+        except ValueError:
+            messagebox.showwarning(self.app._('error_title'), self.app._('error_invalid_page'), parent=self.top)
+            self.page_entry.delete(0, 'end')
+            self.page_entry.insert(0, str(self.current_page))
+            return
+
+        if 1 <= target_page <= self.total_pages:
+            if target_page != self.current_page:
+                self.current_page = target_page
+                self.update_view()
+        else:
+            messagebox.showwarning(self.app._('error_title'), self.app._('error_invalid_page'), parent=self.top)
+            self.page_entry.delete(0, 'end')
+            self.page_entry.insert(0, str(self.current_page))
 
     # ---------------------------------------------------------- Context menu
     def show_context_menu(self, event, path):
