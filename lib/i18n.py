@@ -72,7 +72,7 @@ I18N_STRINGS = {
         'tree_count': "File Count",
         'year_prefix': "Year: {}",
         'confirm_delete_title': "Confirm Deletion",
-        'confirm_delete_msg': "Are you sure you want to permanently delete all files from and before {month:02d}-{year}?\n\nThis action CANNOT be undone.\n\nA random sample of images to be deleted is shown below:",
+        'confirm_delete_msg': "Are you sure you want to permanently delete all files from and before {1:02d}-{0}?\n\nThis action CANNOT be undone.\n\nA random sample of images to be deleted is shown below:",
         'confirm_btn': "Confirm Deletion",
         'cancel_btn': "Cancel",
         'language_menu': "Language",

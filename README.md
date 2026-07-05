@@ -7,7 +7,7 @@
     <a href="https://github.com/steven-jianhao-li/QQ-Group-Images-Cleaner/releases/latest"><img src="https://img.shields.io/github/v/release/steven-jianhao-li/QQ-Group-Images-Cleaner" alt="Latest Release"></a>
     <a href="https://github.com/steven-jianhao-li/QQ-Group-Images-Cleaner/releases"><img src="https://img.shields.io/github/downloads/steven-jianhao-li/QQ-Group-Images-Cleaner/total.svg" alt="Downloads"></a>
     <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
-    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.7+-blue.svg" alt="Python 3.7+"></a>
+    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.12+-blue.svg" alt="Python 3.12+"></a>
 </p>
 </div>
 
@@ -110,8 +110,8 @@ QQ自带的扫描工具兼具扫描速度慢、扫描结果不全、删除文件
 
 ```
 pip install Pillow
-# 或者使用requestments.txt安装
-pip install -r requestments.txt
+# 或者使用requirements.txt安装
+pip install -r requirements.txt
 ```
 
 ### ② 运行程序:
@@ -122,9 +122,9 @@ python qq_group_images_cleaner.py
 ```
 
 ## 📦 依赖
-Python 3.7+
+Python 3.12+
 
-Pillow
+Pillow>=10.1.0
 
 ## 🛠️ 代码结构
 ```
