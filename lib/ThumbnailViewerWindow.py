@@ -1,762 +1,432 @@
+"""Paged image previews backed by index metadata, with scoped selection events."""
+
+import math
 import os
-import sys
-import threading
-from tkinter import (messagebox, ttk, Frame, Label, Scrollbar, StringVar,
-                     Canvas, Menu, Toplevel, Checkbutton, BooleanVar)
-from lib.ToolTip import ToolTip
+import time
+from tkinter import BooleanVar, Canvas, Frame, Label, Menu, StringVar, Toplevel, ttk
+
+from lib.file_metadata import IMAGE_EXTENSIONS, format_size, path_key
 from lib.ImportCheck import import_PIL
-from lib.ConfirmationDialog import ConfirmationDialog
+from lib.theme import ACCENT, BG, BORDER, CARD, FONT, MUTED, TEXT, TINT
+from lib.ToolTip import ToolTip
 
 Image, ImageTk = import_PIL()
+from PIL import ImageOps
 
 
 class ThumbnailViewerWindow:
+    SORT_KEYS = ('time_desc', 'time_asc', 'size_desc', 'size_asc')
+
     def __init__(self, parent, app, image_paths, year, month):
-        self.parent = parent
-        self.app = app
-        self.year = year
-        self.month = month
-
-        self.top = Toplevel(parent)
-        self.top.title(self.app._('thumb_viewer_title', self.year, self.month))
-        self.top.minsize(800, 600)
-        self.top.transient(parent)
-        self.top.grab_set()
-
-        # Data
-        self.all_images = []          # [{path, size, time}, ...]
-        self.photo_references = {}    # path -> PhotoImage
-        self.thumb_labels = {}        # path -> Label
-        self.thumb_vars = {}          # path -> BooleanVar (checkbox state)
-        self.thumb_frames = {}        # path -> Frame (for highlight & bbox)
-        self.selected_paths = set()   # all selected paths (persists across pages)
-
-        # Rubber-band selection state (left-click → select)
-        self.rubber_band_active = False
-        self.drag_started = False
-        self.selection_rect = None
-        self.drag_start_x = None
-        self.drag_start_y = None
-        self.press_widget = None
-
-        # Rubber-band deselection state (right-click → deselect)
-        self.right_rubber_band_active = False
-        self.right_drag_started = False
-        self.right_selection_rect = None
-        self.right_drag_start_x = None
-        self.right_drag_start_y = None
-        self.right_press_widget = None
-
-        # Pagination / layout
-        self.current_page = 1
-        self.items_per_page = StringVar(value='20')
-        self.sort_option = StringVar()
+        self.parent, self.app = parent, app
+        self.service = app.service
+        self.year, self.month = year, month
+        self.custom_paths = tuple(image_paths) if image_paths is not None else None
+        self.closed = False
+        self.generation = 0
+        self.current_page, self.total_pages = 1, 1
         self.columns = 4
-        self.last_width = 0
-
-        self.setup_ui()
-        self.load_image_data(image_paths)
-
-    # ------------------------------------------------------------------ UI
-    def setup_ui(self):
-        # --- Top: centered delete button + hint ---
-        top_btn_frame = Frame(self.top, padx=10)
-        top_btn_frame.pack(fill='x', pady=(10, 0))
-
-        self.delete_selected_button = ttk.Button(
-            top_btn_frame,
-            text=self.app._('delete_selected_btn'),
-            command=self.delete_selected_images
-        )
-        self.delete_selected_button.pack(anchor='center')
-
-        Label(
-            top_btn_frame,
-            text=self.app._('selection_hint'),
-            fg='gray', font=('Segoe UI', 8)
-        ).pack(anchor='center', pady=(2, 0))
-
-        # --- Control frame (pagination / sorting) ---
-        control_frame = Frame(self.top, padx=10, pady=5)
-        control_frame.pack(fill='x')
-
-        Label(control_frame, text=self.app._('items_per_page')).pack(side='left', padx=(0, 5))
-        per_page_combo = ttk.Combobox(control_frame, textvariable=self.items_per_page,
-                                      state='readonly', width=5)
-        per_page_combo['values'] = ['5', '10', '20', '50', '100']
-        per_page_combo.bind('<<ComboboxSelected>>', lambda e: self.update_view())
-        per_page_combo.pack(side='left')
-
-        Label(control_frame, text=self.app._('sort_by')).pack(side='left', padx=(20, 5))
-        sort_menu = ttk.Combobox(control_frame, textvariable=self.sort_option,
-                                 state='readonly', width=20)
-        sort_menu['values'] = [
-            self.app._('sort_time_desc'), self.app._('sort_time_asc'),
-            self.app._('sort_size_desc'), self.app._('sort_size_asc')
-        ]
-        sort_menu.set(self.app._('sort_time_desc'))
-        sort_menu.pack(side='left')
-        sort_menu.bind('<<ComboboxSelected>>', self.sort_and_update)
-
-        # --- Pagination controls (right side) ---
-        self.total_pages_label = Label(control_frame, text="")
-        self.total_pages_label.pack(side='right', padx=10)
-
-        self.page_entry = ttk.Entry(control_frame, width=5, justify='center')
-        self.page_entry.pack(side='right')
-        self.page_entry.bind("<Return>", self.on_goto_page)
-
-        self.goto_label = Label(control_frame, text=self.app._('goto_page'))
-        self.goto_label.pack(side='right', padx=(10, 2))
-
-        self.next_button = ttk.Button(control_frame, text=self.app._('next_page'),
-                                      command=lambda: self.change_page(1))
-        self.next_button.pack(side='right')
-        self.prev_button = ttk.Button(control_frame, text=self.app._('prev_page'),
-                                      command=lambda: self.change_page(-1))
-        self.prev_button.pack(side='right', padx=5)
-
-        # --- Canvas + scrollable frame ---
-        main_frame = Frame(self.top, bd=1, relief='sunken')
-        main_frame.pack(fill='both', expand=True, padx=10, pady=5)
-        self.canvas = Canvas(main_frame)
-        scrollbar = Scrollbar(main_frame, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = Frame(self.canvas)
-
-        self.scrollable_frame.bind("<Configure>",
-                                   lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # --- Mouse wheel scrolling ---
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
-
-        # --- Rubber-band selection bindings (left-click → select) ---
-        self.canvas.bind("<ButtonPress-1>", self.on_rubber_band_press)
-        self.scrollable_frame.bind("<ButtonPress-1>", self.on_rubber_band_press)
-        self.canvas.bind_all("<B1-Motion>", self.on_rubber_band_drag)
-        self.canvas.bind_all("<ButtonRelease-1>", self.on_rubber_band_release)
-
-        # --- Rubber-band deselection bindings (right-click → deselect) ---
-        self.canvas.bind("<ButtonPress-3>", self.on_right_rubber_band_press)
-        self.scrollable_frame.bind("<ButtonPress-3>", self.on_right_rubber_band_press)
-        self.canvas.bind_all("<B3-Motion>", self.on_right_rubber_band_drag)
-        self.canvas.bind_all("<ButtonRelease-3>", self.on_right_rubber_band_release)
-
-        # --- Resize ---
-        self.top.bind('<Configure>', self.on_resize)
-
-        # --- Right-click context menu ---
-        self.context_menu = Menu(self.top, tearoff=0)
-        self.context_menu.add_command(label=self.app._('context_delete'), command=self.delete_image)
-        self.context_menu.add_command(label=self.app._('context_open'), command=self.open_image)
-        self.context_menu.add_command(label=self.app._('context_open_dir'),
-                                      command=self.open_image_directory)
+        self.sort_key = 'time_desc'
+        self.items_per_page = StringVar(parent, value='20')
+        self.sort_option = StringVar(parent)
+        self.page_select_var = BooleanVar(parent, value=False)
+        self.page_number = StringVar(parent, value='1')
+        self.selected_paths = set()
+        self.images_on_page = []
+        self.photos, self.thumb_labels, self.thumb_frames, self.thumb_vars = {}, {}, {}, {}
+        self.widget_paths = {}
+        self.drag = None
+        self.selection_rect = None
         self.clicked_image_path = None
+        self.top = Toplevel(parent, background=BG)
+        self.top.transient(parent)
+        self.top.geometry('1050x750')
+        self.top.minsize(850, 620)
+        self.top.protocol('WM_DELETE_WINDOW', self.close)
+        self.setup_ui()
+        self.update_language()
+        self.reload()
 
-    # ---------------------------------------------------------- Mouse wheel
-    def _on_mousewheel(self, event):
-        """Handle mouse wheel scrolling on the canvas."""
-        if sys.platform == "win32":
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        elif sys.platform == "darwin":
-            self.canvas.yview_scroll(int(-1 * event.delta), "units")
-        else:
-            if event.num == 4:
-                self.canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                self.canvas.yview_scroll(1, "units")
+    def setup_ui(self):
+        header = ttk.Frame(self.top, padding=(20, 16, 20, 8))
+        header.pack(fill='x')
+        self.heading = ttk.Label(header, style='Title.TLabel')
+        self.heading.pack(side='left')
+        self.delete_selected_button = ttk.Button(header, style='Recycle.TButton',
+                                                   command=self.delete_selected_images)
+        self.delete_selected_button.pack(side='right')
+        self.hint = ttk.Label(self.top, style='Muted.TLabel')
+        self.hint.pack(anchor='w', padx=22, pady=(2, 12))
+        controls = ttk.Frame(self.top, padding=(20, 0, 20, 12))
+        controls.pack(fill='x')
+        self.per_page_label = ttk.Label(controls)
+        self.per_page_label.pack(side='left', padx=(0, 8))
+        per_page = ttk.Combobox(controls, textvariable=self.items_per_page, state='readonly',
+                                values=('10', '20', '50', '100'), width=5)
+        per_page.pack(side='left')
+        per_page.bind('<<ComboboxSelected>>', self._reset_page)
+        self.sort_label = ttk.Label(controls)
+        self.sort_label.pack(side='left', padx=(20, 8))
+        self.sort_menu = ttk.Combobox(controls, textvariable=self.sort_option, state='readonly', width=23)
+        self.sort_menu.pack(side='left')
+        self.sort_menu.bind('<<ComboboxSelected>>', self._sort_changed)
+        self.page_select_check = ttk.Checkbutton(controls, variable=self.page_select_var,
+                                                command=self.toggle_current_page_selection)
+        self.page_select_check.pack(side='left', padx=(18, 0))
+        self.clear_button = ttk.Button(controls, command=self.clear_selection)
+        self.clear_button.pack(side='right')
 
-    def on_resize(self, event):
-        """Handle window resize to reflow thumbnails."""
-        new_width = event.width
-        if new_width != self.last_width:
-            self.last_width = new_width
-            new_columns = max(1, (self.canvas.winfo_width() - 20) // 180)
-            if new_columns != self.columns:
-                self.columns = new_columns
-                self.update_view(force_reload=False)
+        frame = ttk.Frame(self.top, style='Card.TFrame')
+        frame.pack(fill='both', expand=True, padx=20)
+        self.canvas = Canvas(frame, background=BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(frame, orient='vertical', command=self.canvas.yview)
+        scrollbar.pack(side='right', fill='y')
+        self.canvas.pack(side='left', fill='both', expand=True)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.scrollable_frame = Frame(self.canvas, background=BG)
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor='nw')
+        self.scrollable_frame.bind('<Configure>', lambda _: self.canvas.configure(scrollregion=self.canvas.bbox('all')))
+        self.canvas.bind('<Configure>', self._resize)
+        footer = ttk.Frame(self.top, padding=(20, 12))
+        footer.pack(fill='x')
+        self.selection_label = ttk.Label(footer, style='Muted.TLabel')
+        self.selection_label.pack(side='left')
+        self.next_button = ttk.Button(footer, command=lambda: self.change_page(1))
+        self.next_button.pack(side='right')
+        self.total_pages_label = ttk.Label(footer)
+        self.total_pages_label.pack(side='right', padx=8)
+        self.page_entry = ttk.Entry(footer, width=5, justify='center', textvariable=self.page_number)
+        self.page_entry.pack(side='right')
+        self.page_entry.bind('<Return>', self.on_goto_page)
+        self.goto_label = ttk.Label(footer)
+        self.goto_label.pack(side='right', padx=(12, 6))
+        self.prev_button = ttk.Button(footer, command=lambda: self.change_page(-1))
+        self.prev_button.pack(side='right')
+        self.context_menu = Menu(self.top, tearoff=0)
+        self.context_menu.add_command(command=self.delete_image)
+        self.context_menu.add_command(command=self.open_image)
+        self.context_menu.add_command(command=self.open_image_directory)
+        # Toplevel bindtags receive child events without global bind_all hooks.
+        self.top.bind('<MouseWheel>', self._on_mousewheel)
+        self.top.bind('<Button-4>', self._on_mousewheel)
+        self.top.bind('<Button-5>', self._on_mousewheel)
+        self.top.bind('<ButtonPress-1>', lambda event: self._drag_press(event, False))
+        self.top.bind('<ButtonPress-3>', lambda event: self._drag_press(event, True))
+        self.top.bind('<B1-Motion>', self._drag_motion)
+        self.top.bind('<B3-Motion>', self._drag_motion)
+        self.top.bind('<ButtonRelease-1>', self._drag_release)
+        self.top.bind('<ButtonRelease-3>', self._drag_release)
 
-    # ---------------------------------------------------------- Data loading
-    def load_image_data(self, image_paths):
-        """Load image metadata in a separate thread."""
-        threading.Thread(target=self._load_image_data_thread,
-                         args=(image_paths,), daemon=True).start()
-
-    def _load_image_data_thread(self, image_paths):
-        temp_list = []
-        for path in image_paths:
-            try:
-                stat = os.stat(path)
-                # Fix #7: use min(ctime, mtime, atime) as the "real time"
-                real_time = min(stat.st_ctime, stat.st_mtime, stat.st_atime)
-                temp_list.append({'path': path, 'size': stat.st_size, 'time': real_time})
-            except FileNotFoundError:
-                continue
-        self.all_images = temp_list
-        self.top.after(0, self.sort_and_update)
-
-    # ---------------------------------------------------------- Sort / view
-    def sort_and_update(self, event=None):
-        """Sorts the master list of images and updates the view."""
-        sort_key = self.sort_option.get()
-        reverse = True
-        if sort_key in [self.app._('sort_time_asc'), self.app._('sort_size_asc')]:
-            reverse = False
-
-        key_func = 'time'
-        if sort_key in [self.app._('sort_size_asc'), self.app._('sort_size_desc')]:
-            key_func = 'size'
-
-        self.all_images.sort(key=lambda x: x[key_func], reverse=reverse)
-        self.current_page = 1
-        self.update_view()
-
-    def update_view(self, force_reload=True):
-        """Clears and repopulates the thumbnail view for the current page."""
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-
-        if force_reload:
-            self.photo_references.clear()
-
-        # Per-page widget dicts are rebuilt in populate_thumbnails
-        self.thumb_labels.clear()
-        self.thumb_vars.clear()
-        self.thumb_frames.clear()
-
-        try:
-            per_page = int(self.items_per_page.get())
-        except ValueError:
-            per_page = 20
-
-        total_items = len(self.all_images)
-        self.total_pages = (total_items + per_page - 1) // per_page
-        if self.total_pages == 0:
-            self.total_pages = 1
-
-        start_index = (self.current_page - 1) * per_page
-        end_index = start_index + per_page
-        self.images_on_page = self.all_images[start_index:end_index]
-
-        # --- Fix #5: prevent memory leak ---
-        # Remove PhotoImage references that no longer belong to the current page.
-        current_page_paths = set(img['path'] for img in self.images_on_page)
-        paths_to_remove = [p for p in list(self.photo_references.keys())
-                           if p not in current_page_paths]
-        for p in paths_to_remove:
-            del self.photo_references[p]
-
+    def update_language(self):
+        title = self.app._('thumb_viewer_title', self.year, self.month)
+        self.top.title(title)
+        self.heading.configure(text=title)
+        for widget, key in ((self.hint, 'selection_hint'), (self.per_page_label, 'items_per_page'),
+                            (self.sort_label, 'sort_by'), (self.page_select_check, 'select_current_page'),
+                            (self.clear_button, 'clear_selection'), (self.prev_button, 'prev_page'),
+                            (self.next_button, 'next_page'), (self.goto_label, 'goto_page')):
+            widget.configure(text=self.app._(key))
+        values = [self.app._('sort_' + key) for key in self.SORT_KEYS]
+        self.sort_menu.configure(values=values)
+        self.sort_option.set(self.app._('sort_' + self.sort_key))
+        for index, key in enumerate(('context_delete', 'context_open', 'context_open_dir')):
+            self.context_menu.entryconfigure(index, label=self.app._(key))
+        self._update_selection_state()
         self.update_page_controls()
 
-        if self.images_on_page:
-            missing = [img for img in self.images_on_page
-                       if img['path'] not in self.photo_references]
-            if missing:
-                threading.Thread(target=self._load_thumbnails_thread,
-                                 args=(missing, self.images_on_page),
-                                 daemon=True).start()
-            else:
-                self.populate_thumbnails(self.images_on_page)
+    def _reset_page(self, _=None):
+        self.current_page = 1
+        self.reload()
 
-    # --- Fix #4: thread-safe thumbnail loading ---
-    # Worker thread only does Image.open() / thumbnail() (PIL operations).
-    # ImageTk.PhotoImage instantiation happens in the main thread via after().
-    def _load_thumbnails_thread(self, image_data, full_page_data=None):
-        """Load thumbnail images in the background (PIL only — thread-safe).
+    def _sort_changed(self, _=None):
+        index = self.sort_menu.current()
+        if 0 <= index < len(self.SORT_KEYS):
+            self.sort_key = self.SORT_KEYS[index]
+        self._reset_page()
 
-        Only ``Image.open()`` and ``thumbnail()`` are called here.
-        ``ImageTk.PhotoImage`` instantiation is deferred to the main
-        thread via ``after()`` to keep Tkinter thread-safe.
-        """
-        for data in image_data:
-            path = data['path']
-            try:
-                image = Image.open(path)
-                image.thumbnail((150, 150))
-                # Send PIL Image to main thread for PhotoImage creation
-                self.top.after(0, self._create_photo_image, path, image)
-            except Exception as e:
-                print(f"Error loading thumbnail for {path}: {e}")
-        # After all PhotoImages are queued, populate the view in main thread
-        target_data = full_page_data if full_page_data is not None else image_data
-        self.top.after(0, lambda: self.populate_thumbnails(target_data))
-
-    def _create_photo_image(self, path, pil_image):
-        """Create ImageTk.PhotoImage in the main thread (thread-safe)."""
-        if not self.top.winfo_exists():
-            try:
-                pil_image.close()
-            except Exception:
-                pass
+    def reload(self):
+        if self.closed:
             return
-        if path in self.photo_references:
-            try:
-                pil_image.close()
-            except Exception:
-                pass
+        self.generation += 1
+        generation, page = self.generation, self.current_page
+        per_page, sort_key = int(self.items_per_page.get()), self.sort_key
+        service, custom = self.service, self.custom_paths
+        def query():
+            if custom is not None:
+                rows = [service.store.record(path) for path in custom]
+                rows = [row for row in rows if row and row['extension'] in IMAGE_EXTENSIONS]
+                key = 'size' if sort_key.startswith('size') else 'real_time'
+                rows.sort(key=lambda row: (row[key], row['path']), reverse=sort_key.endswith('desc'))
+                return rows[(page - 1) * per_page:page * per_page], len(rows)
+            return service.store.query_files(year=self.year, month=self.month, images_only=True,
+                                             sort=sort_key, limit=per_page, offset=(page - 1) * per_page)
+        self.app.run_background(query, lambda value: self._accept_page(generation, value),
+                                lambda error: self._query_failed(generation, error))
+
+    def _query_failed(self, generation, error):
+        if not self.closed and generation == self.generation:
+            self.app.show_error(error)
+
+    @staticmethod
+    def _signature(row):
+        return row['size'], row['mtime_ns'], row['ctime_ns']
+
+    def _accept_page(self, generation, value):
+        if self.closed or generation != self.generation:
             return
-        try:
-            photo = ImageTk.PhotoImage(pil_image)
-            self.photo_references[path] = photo
-        except Exception as e:
-            print(f"Error creating PhotoImage for {path}: {e}")
-        finally:
-            try:
-                pil_image.close()
-            except Exception:
-                pass
-
-    def populate_thumbnails(self, image_data):
-        """Place loaded thumbnails onto the canvas in a fixed grid."""
-        if not self.top.winfo_exists():
-            return
-
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-        self.thumb_labels.clear()
-        self.thumb_vars.clear()
-        self.thumb_frames.clear()
-
-        for i, data in enumerate(image_data):
-            path = data['path']
-            photo = self.photo_references.get(path)
-            if not photo:
-                continue
-
-            row, col = divmod(i, self.columns)
-
-            frame = Frame(self.scrollable_frame, width=170, height=170, bg='white')
-            frame.grid(row=row, column=col, padx=5, pady=5, sticky='nsew')
-            frame.grid_propagate(False)
-
-            label = Label(frame, image=photo, bg='white')
-            label.pack(expand=True)
-            self.thumb_labels[path] = label
-
-            # --- Selection checkbox (top-right corner) ---
-            is_selected = path in self.selected_paths
-            var = BooleanVar(value=is_selected)
-            cb = Checkbutton(frame, variable=var, bg='white', activebackground='white',
-                             command=lambda p=path, v=var: self.on_checkbox_toggle(p, v))
-            cb.place(relx=1.0, rely=0.0, anchor='ne', x=-2, y=2)
-            self.thumb_vars[path] = var
-            self.thumb_frames[path] = frame
-
-            if is_selected:
-                frame.config(highlightbackground='#0078d7', highlightthickness=3)
-
-            # Right-press → start right rubber-band (deselect) or show context menu on release
-            label.bind("<ButtonPress-3>", self.on_right_rubber_band_press)
-            # Left-press → start rubber-band (or single-click toggle on release)
-            label.bind("<ButtonPress-1>", self.on_rubber_band_press)
-            ToolTip(label, os.path.basename(path))
-
-        for col_index in range(self.columns):
-            self.scrollable_frame.grid_columnconfigure(col_index, weight=1)
-
-        self._update_delete_button_text()
-
-    def update_page_controls(self):
-        """Update the state of pagination buttons, entry, and label."""
-        has_multiple_pages = self.total_pages > 1
-        self.total_pages_label.config(text=self.app._('page_count_suffix', self.total_pages))
-
-        self.page_entry.config(state='normal')  # Temporarily enable to update text
-        self.page_entry.delete(0, 'end')
-        self.page_entry.insert(0, str(self.current_page))
-        self.page_entry.config(state='normal' if has_multiple_pages else 'disabled')
-
-        self.prev_button.config(
-            state='normal' if (has_multiple_pages and self.current_page > 1) else 'disabled')
-        self.next_button.config(
-            state='normal' if (has_multiple_pages and self.current_page < self.total_pages) else 'disabled')
-
-    def change_page(self, delta):
-        """Navigate to the previous or next page."""
-        new_page = self.current_page + delta
-        if 1 <= new_page <= self.total_pages:
-            self.current_page = new_page
-            self.update_view()
-
-    def on_goto_page(self, event=None):
-        """Handle page jump when user presses Enter in the page entry."""
-        try:
-            target_page = int(self.page_entry.get())
-        except ValueError:
-            messagebox.showwarning(self.app._('error_title'), self.app._('error_invalid_page'), parent=self.top)
-            self.page_entry.delete(0, 'end')
-            self.page_entry.insert(0, str(self.current_page))
-            return
-
-        if 1 <= target_page <= self.total_pages:
-            if target_page != self.current_page:
-                self.current_page = target_page
-                self.update_view()
-        else:
-            messagebox.showwarning(self.app._('error_title'), self.app._('error_invalid_page'), parent=self.top)
-            self.page_entry.delete(0, 'end')
-            self.page_entry.insert(0, str(self.current_page))
-
-    # ---------------------------------------------------------- Context menu
-    def show_context_menu(self, event, path):
-        self.clicked_image_path = path
-        self.context_menu.post(event.x_root, event.y_root)
-
-    # ============================================================ Selection
-    def _update_delete_button_text(self):
-        count = len(self.selected_paths)
-        if count > 0:
-            self.delete_selected_button.config(
-                text=self.app._('delete_selected_btn_with_count', count))
-        else:
-            self.delete_selected_button.config(
-                text=self.app._('delete_selected_btn'))
-
-    def on_checkbox_toggle(self, path, var):
-        """Called when the user clicks a thumbnail's checkbox."""
-        if var.get():
-            self._select(path)
-        else:
-            self._deselect(path)
-        self._update_delete_button_text()
-
-    def _select(self, path):
-        self.selected_paths.add(path)
-        if path in self.thumb_vars:
-            self.thumb_vars[path].set(True)
-        if path in self.thumb_frames:
-            self.thumb_frames[path].config(highlightbackground='#0078d7',
-                                           highlightthickness=3)
-
-    def _deselect(self, path):
-        self.selected_paths.discard(path)
-        if path in self.thumb_vars:
-            self.thumb_vars[path].set(False)
-        if path in self.thumb_frames:
-            self.thumb_frames[path].config(highlightthickness=0)
-
-    def _toggle_selection(self, path):
-        if path in self.selected_paths:
-            self._deselect(path)
-        else:
-            self._select(path)
-        self._update_delete_button_text()
-
-    # ---------------------------------------------------------- Rubber-band (left-click: select)
-    def _get_canvas_coords(self, event):
-        """Convert event coordinates (from any widget) to canvas coordinates."""
-        cx = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
-        cy = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
-        return cx, cy
-
-    def on_rubber_band_press(self, event):
-        self.rubber_band_active = True
-        self.drag_started = False
-        self.press_widget = event.widget
-        self.drag_start_x, self.drag_start_y = self._get_canvas_coords(event)
-        # Clean up any leftover rectangle
-        if self.selection_rect:
-            self.canvas.delete(self.selection_rect)
-            self.selection_rect = None
-
-    def on_rubber_band_drag(self, event):
-        if not self.rubber_band_active:
-            return
-        cur_x, cur_y = self._get_canvas_coords(event)
-
-        # Only create the rectangle after a small movement threshold
-        if not self.drag_started:
-            if (abs(cur_x - self.drag_start_x) < 5 and
-                    abs(cur_y - self.drag_start_y) < 5):
-                return
-            self.drag_started = True
-            self.selection_rect = self.canvas.create_rectangle(
-                self.drag_start_x, self.drag_start_y, cur_x, cur_y,
-                outline='#0078d7', width=2, dash=(4, 2)
-            )
-        else:
-            self.canvas.coords(self.selection_rect,
-                               self.drag_start_x, self.drag_start_y,
-                               cur_x, cur_y)
-        # Real-time selection update
-        self._select_within_rect(self.drag_start_x, self.drag_start_y,
-                                 cur_x, cur_y)
-
-    def on_rubber_band_release(self, event):
-        if not self.rubber_band_active:
-            return
-        self.rubber_band_active = False
-
-        if self.drag_started:
-            # Rubber-band completed — clean up rectangle
-            if self.selection_rect:
-                self.canvas.delete(self.selection_rect)
-                self.selection_rect = None
-        else:
-            # Single click without drag — toggle the thumbnail under cursor
-            if isinstance(self.press_widget, Label):
-                path = None
-                for p, lbl in self.thumb_labels.items():
-                    if lbl is self.press_widget:
-                        path = p
-                        break
-                if path:
-                    self._toggle_selection(path)
-
-        self.press_widget = None
-        self.drag_started = False
-
-    def _select_within_rect(self, x1, y1, x2, y2):
-        """Select every thumbnail whose frame intersects the rectangle."""
-        left = min(x1, x2)
-        right = max(x1, x2)
-        top = min(y1, y2)
-        bottom = max(y1, y2)
-
-        for path, frame in self.thumb_frames.items():
-            if not frame.winfo_ismapped():
-                continue
-            fx = frame.winfo_x()
-            fy = frame.winfo_y()
-            fw = frame.winfo_width()
-            fh = frame.winfo_height()
-
-            intersects = (fx < right and fx + fw > left and
-                          fy < bottom and fy + fh > top)
-            if intersects and path not in self.selected_paths:
-                self._select(path)
-
-        self._update_delete_button_text()
-
-    # ---------------------------------------------------------- Rubber-band (right-click: deselect)
-    def on_right_rubber_band_press(self, event):
-        """Start tracking a right-click for potential drag-deselect."""
-        self.right_rubber_band_active = True
-        self.right_drag_started = False
-        self.right_press_widget = event.widget
-        self.right_drag_start_x, self.right_drag_start_y = self._get_canvas_coords(event)
-        # Clean up any leftover rectangle
-        if self.right_selection_rect:
-            self.canvas.delete(self.right_selection_rect)
-            self.right_selection_rect = None
-
-    def on_right_rubber_band_drag(self, event):
-        """Update the deselection rectangle while right-dragging."""
-        if not self.right_rubber_band_active:
-            return
-        cur_x, cur_y = self._get_canvas_coords(event)
-
-        # Only create the rectangle after a small movement threshold
-        if not self.right_drag_started:
-            if (abs(cur_x - self.right_drag_start_x) < 5 and
-                    abs(cur_y - self.right_drag_start_y) < 5):
-                return
-            self.right_drag_started = True
-            self.right_selection_rect = self.canvas.create_rectangle(
-                self.right_drag_start_x, self.right_drag_start_y, cur_x, cur_y,
-                outline='#d70000', width=2, dash=(4, 2)
-            )
-        else:
-            self.canvas.coords(self.right_selection_rect,
-                               self.right_drag_start_x, self.right_drag_start_y,
-                               cur_x, cur_y)
-        # Real-time deselection update
-        self._deselect_within_rect(self.right_drag_start_x, self.right_drag_start_y,
-                                   cur_x, cur_y)
-
-    def on_right_rubber_band_release(self, event):
-        """Finalize right-drag deselection, or show context menu on simple right-click."""
-        if not self.right_rubber_band_active:
-            return
-        self.right_rubber_band_active = False
-
-        if self.right_drag_started:
-            # Rubber-band deselection completed — clean up rectangle
-            if self.right_selection_rect:
-                self.canvas.delete(self.right_selection_rect)
-                self.right_selection_rect = None
-        else:
-            # Single right-click without drag — show context menu if on a thumbnail
-            if isinstance(self.right_press_widget, Label):
-                path = None
-                for p, lbl in self.thumb_labels.items():
-                    if lbl is self.right_press_widget:
-                        path = p
-                        break
-                if path:
-                    self.show_context_menu(event, path)
-
-        self.right_press_widget = None
-        self.right_drag_started = False
-
-    def _deselect_within_rect(self, x1, y1, x2, y2):
-        """Deselect every selected thumbnail whose frame intersects the rectangle."""
-        left = min(x1, x2)
-        right = max(x1, x2)
-        top = min(y1, y2)
-        bottom = max(y1, y2)
-
-        for path, frame in self.thumb_frames.items():
-            if not frame.winfo_ismapped():
-                continue
-            fx = frame.winfo_x()
-            fy = frame.winfo_y()
-            fw = frame.winfo_width()
-            fh = frame.winfo_height()
-
-            intersects = (fx < right and fx + fw > left and
-                          fy < bottom and fy + fh > top)
-            if intersects and path in self.selected_paths:
-                self._deselect(path)
-
-        self._update_delete_button_text()
-
-    # ============================================================ Deletion
-    # Fix #6: decouple file deletion from UI cleanup so that a failed
-    # deletion does not corrupt in-memory data structures.
-    def delete_selected_images(self):
-        """Delete all selected images (checkbox + rubber-band) after confirmation."""
-        if not self.selected_paths:
-            messagebox.showinfo(self.app._('error_title'),
-                                self.app._('no_selection_msg'),
-                                parent=self.top)
-            return
-
-        paths_to_delete = list(self.selected_paths)
-
-        # Build preview list (images only)
-        image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.bmp')
-        image_paths_to_preview = [p for p in paths_to_delete
-                                  if p.lower().endswith(image_extensions)]
-
-        custom_msg = self.app._('confirm_selected_delete_msg', len(paths_to_delete))
-        dialog = ConfirmationDialog(
-            self.top, self.app, self.year, self.month,
-            image_paths_to_preview, custom_message=custom_msg
-        )
-        self.top.wait_window(dialog.top)
-
-        if not dialog.confirmed:
-            return
-
-        deleted_count = 0
-        error_count = 0
-        deleted_paths = set()
-
-        for path in paths_to_delete:
-            try:
-                os.remove(path)
-                deleted_count += 1
-                deleted_paths.add(path)
-            except Exception as e:
-                print(f"Could not delete {path}: {e}")
-                error_count += 1
-
-        # Clean up references ONLY for successfully deleted files
-        for path in deleted_paths:
-            self.selected_paths.discard(path)
-            self.thumb_vars.pop(path, None)
-            if path in self.thumb_frames:
-                try:
-                    self.thumb_frames[path].destroy()
-                except Exception:
-                    pass
-                del self.thumb_frames[path]
-            self.thumb_labels.pop(path, None)
-            self.photo_references.pop(path, None)
-            try:
-                if path in self.app.file_data[self.year][self.month]['paths']:
-                    self.app.file_data[self.year][self.month]['paths'].remove(path)
-            except (KeyError, ValueError):
-                pass
-
-        # Update image lists — only remove successfully deleted files
-        self.all_images = [img for img in self.all_images
-                           if img['path'] not in deleted_paths]
-
-        # Recalculate pagination
-        try:
-            per_page = int(self.items_per_page.get())
-        except ValueError:
-            per_page = 20
-        self.total_pages = max(1, (len(self.all_images) + per_page - 1) // per_page)
+        rows, count = value
+        self.total_pages = max(1, math.ceil(count / int(self.items_per_page.get())))
         if self.current_page > self.total_pages:
             self.current_page = self.total_pages
-
-        # Refresh view (reuse cached thumbnails)
-        self.update_view(force_reload=False)
-        self._update_delete_button_text()
-
-        messagebox.showinfo(
-            self.app._('confirm_delete_title'),
-            self.app._('status_delete_complete', deleted_count, error_count),
-            parent=self.top
-        )
-
-    # ---------------------------------------------------- Single-file delete (right-click)
-    # Fix #6: if os.remove fails, return early without touching UI state.
-    def delete_image(self):
-        """Right-click → Delete (with proper exception handling)."""
-        path = self.clicked_image_path
-        if not path:
+            self.reload()
             return
+        self.images_on_page = rows
+        keep = {row['display_path'] for row in rows}
+        self.photos = {path: photo for path, photo in self.photos.items() if path in keep}
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        self.thumb_frames, self.thumb_labels, self.thumb_vars, self.widget_paths = {}, {}, {}, {}
+        if not rows:
+            Label(self.scrollable_frame, text=self.app._('preview_empty'), background=BG,
+                  foreground=MUTED, pady=70).grid(row=0, column=0, sticky='ew')
+        missing = []
+        for index, row in enumerate(rows):
+            path = row['display_path']
+            card = Frame(self.scrollable_frame, width=182, height=214, background=CARD,
+                         highlightbackground=BORDER, highlightthickness=2)
+            card.grid_propagate(False)
+            card.grid(row=index // self.columns, column=index % self.columns, padx=6, pady=6, sticky='n')
+            image = Label(card, text=self.app._('loading_thumbnails'), background=CARD, foreground=MUTED)
+            image.place(x=11, y=12, width=156, height=146)
+            cached = self.photos.get(path)
+            if cached and cached[0] == self._signature(row):
+                image.configure(image=cached[1], text='')
+            else:
+                missing.append(row)
+            name = row['name']
+            label = Label(card, text=name if len(name) <= 23 else name[:20] + '…', background=CARD,
+                          foreground=TEXT, font=(FONT, 9), anchor='w')
+            label.place(x=10, y=164, width=157, height=20)
+            details = Label(card, text=f'{format_size(row["size"])} · {time.strftime("%Y-%m-%d", time.localtime(row["real_time"]))}',
+                            background=CARD, foreground=MUTED, font=(FONT, 8), anchor='w')
+            details.place(x=10, y=184, width=159, height=18)
+            variable = BooleanVar(self.top, value=path in self.selected_paths)
+            check = ttk.Checkbutton(card, variable=variable, style='Card.TCheckbutton',
+                                    command=lambda chosen=path: self.on_checkbox_toggle(chosen))
+            check.place(x=147, y=3)
+            self.thumb_frames[path], self.thumb_labels[path], self.thumb_vars[path] = card, image, variable
+            for widget in (card, image, label, details):
+                self.widget_paths[widget] = path
+                ToolTip(widget, path)
+            image.bind('<Double-1>', lambda _, chosen=path: self.app.open_path(chosen))
+        self._reflow()
+        self.update_page_controls()
+        self._update_selection_state()
+        if missing:
+            self.app.run_background(lambda: self._decode_page(missing),
+                                    lambda images: self._accept_images(generation, images))
 
-        if messagebox.askyesno(
-                self.app._('confirm_delete_title'),
-                f"确认删除文件?\n{os.path.basename(path)}",
-                parent=self.top):
-            # --- Step 1: attempt file deletion ---
+    @staticmethod
+    def _decode_page(rows):
+        images = []
+        for row in rows:
             try:
-                os.remove(path)
-            except Exception as e:
-                messagebox.showerror(self.app._('error_title'),
-                                     f"删除失败: {e}", parent=self.top)
-                return  # deletion failed — do NOT modify UI or data
+                with Image.open(row['display_path']) as source:
+                    image = ImageOps.exif_transpose(source)
+                    image.thumbnail((150, 142))
+                    thumbnail = image.copy()
+                images.append((row['display_path'], ThumbnailViewerWindow._signature(row), thumbnail))
+            except (OSError, ValueError, Image.DecompressionBombError):
+                images.append((row['display_path'], ThumbnailViewerWindow._signature(row), None))
+        return images
 
-            # --- Step 2: deletion succeeded — safely clean up UI & data ---
+    def _accept_images(self, generation, images):
+        for path, signature, pil_image in images:
             try:
-                if path in self.thumb_labels:
-                    self.thumb_labels[path].master.destroy()
-                    del self.thumb_labels[path]
-            except Exception:
-                pass
+                if self.closed or generation != self.generation or path not in self.thumb_labels:
+                    continue
+                if pil_image is None:
+                    self.thumb_labels[path].configure(text=self.app._('image_unavailable'))
+                else:
+                    photo = ImageTk.PhotoImage(pil_image, master=self.top)
+                    self.photos[path] = (signature, photo)
+                    self.thumb_labels[path].configure(image=photo, text='')
+            finally:
+                if pil_image is not None:
+                    pil_image.close()
 
+    def _resize(self, event):
+        self.canvas.itemconfigure(self.canvas_window, width=event.width)
+        columns = max(1, event.width // 196)
+        if columns != self.columns:
+            self.columns = columns
+            self._reflow()
+
+    def _reflow(self):
+        if self.closed:
+            return
+        for index, row in enumerate(self.images_on_page):
+            card = self.thumb_frames.get(row['display_path'])
+            if card:
+                card.grid_configure(row=index // self.columns, column=index % self.columns)
+        for column in range(8):
+            self.scrollable_frame.grid_columnconfigure(column, weight=1 if column < self.columns else 0)
+
+    def _on_mousewheel(self, event):
+        x, y = event.x_root - self.canvas.winfo_rootx(), event.y_root - self.canvas.winfo_rooty()
+        if 0 <= x < self.canvas.winfo_width() and 0 <= y < self.canvas.winfo_height():
+            amount = -int(event.delta / 120) if event.delta else (-1 if event.num == 4 else 1)
+            self.canvas.yview_scroll(amount, 'units')
+            return 'break'
+
+    def _get_current_page_paths(self):
+        return [row['display_path'] for row in self.images_on_page]
+
+    def _is_current_page_fully_selected(self):
+        paths = self._get_current_page_paths()
+        return bool(paths) and all(path in self.selected_paths for path in paths)
+
+    def _update_selection_state(self):
+        for path, variable in self.thumb_vars.items():
+            selected = path in self.selected_paths
+            variable.set(selected)
+            self.thumb_frames[path].configure(highlightbackground=ACCENT if selected else BORDER,
+                                               background=TINT if selected else CARD)
+        count = len(self.selected_paths)
+        self.page_select_var.set(self._is_current_page_fully_selected())
+        self.page_select_check.configure(state='normal' if self.images_on_page else 'disabled')
+        self.selection_label.configure(text=self.app._('selection_count', count))
+        self.delete_selected_button.configure(text=self.app._('delete_selected_btn_with_count', count)
+                                               if count else self.app._('delete_selected_btn'),
+                                               state='normal' if count else 'disabled')
+        self.clear_button.configure(state='normal' if count else 'disabled')
+
+    def on_checkbox_toggle(self, path):
+        if self.thumb_vars[path].get():
+            self.selected_paths.add(path)
+        else:
             self.selected_paths.discard(path)
-            self.thumb_vars.pop(path, None)
-            self.thumb_frames.pop(path, None)
-            self.photo_references.pop(path, None)
+        self._update_selection_state()
 
-            self.all_images = [img for img in self.all_images
-                               if img['path'] != path]
-            self.images_on_page = [img for img in self.images_on_page
-                                   if img['path'] != path]
+    def toggle_current_page_selection(self):
+        paths = self._get_current_page_paths()
+        if self._is_current_page_fully_selected():
+            self.selected_paths.difference_update(paths)
+        else:
+            self.selected_paths.update(paths)
+        self._update_selection_state()
 
-            self.populate_thumbnails(self.images_on_page)
-            self.update_page_controls()
+    def clear_selection(self):
+        self.selected_paths.clear()
+        self._update_selection_state()
 
+    def _drag_press(self, event, deselect):
+        if event.widget not in self.widget_paths and event.widget not in (self.canvas, self.scrollable_frame):
+            return
+        self.drag = {'x': event.x_root, 'y': event.y_root, 'deselect': deselect,
+                     'before': set(self.selected_paths), 'active': False,
+                     'path': self.widget_paths.get(event.widget)}
+
+    def _drag_motion(self, event):
+        if self.drag is None:
+            return
+        if not self.drag['active'] and abs(event.x_root - self.drag['x']) + abs(event.y_root - self.drag['y']) < 7:
+            return
+        self.drag['active'] = True
+        x0, x1 = sorted((self.drag['x'], event.x_root))
+        y0, y1 = sorted((self.drag['y'], event.y_root))
+        hit = set()
+        for path, card in self.thumb_frames.items():
+            left, top = card.winfo_rootx(), card.winfo_rooty()
+            if x0 < left + card.winfo_width() and x1 > left and y0 < top + card.winfo_height() and y1 > top:
+                hit.add(path)
+        self.selected_paths = self.drag['before'] - hit if self.drag['deselect'] else self.drag['before'] | hit
+        self._update_selection_state()
+        coords = (self.canvas.canvasx(x0 - self.canvas.winfo_rootx()),
+                  self.canvas.canvasy(y0 - self.canvas.winfo_rooty()),
+                  self.canvas.canvasx(x1 - self.canvas.winfo_rootx()),
+                  self.canvas.canvasy(y1 - self.canvas.winfo_rooty()))
+        if self.selection_rect is None:
+            self.selection_rect = self.canvas.create_rectangle(*coords, outline=ACCENT, dash=(4, 3), width=2)
+        else:
+            self.canvas.coords(self.selection_rect, *coords)
+
+    def _drag_release(self, event):
+        if self.drag is None:
+            return
+        drag, self.drag = self.drag, None
+        if self.selection_rect is not None:
+            self.canvas.delete(self.selection_rect)
+            self.selection_rect = None
+        if drag['active']:
+            return
+        path = drag['path']
+        if path and drag['deselect']:
+            self.clicked_image_path = path
             try:
-                self.app.file_data[self.year][self.month]['paths'].remove(path)
-            except (KeyError, ValueError):
-                pass
+                self.context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.context_menu.grab_release()
+        elif path:
+            if path in self.selected_paths:
+                self.selected_paths.discard(path)
+            else:
+                self.selected_paths.add(path)
+            self._update_selection_state()
+
+    def update_page_controls(self):
+        self.page_number.set(str(self.current_page))
+        self.total_pages_label.configure(text=self.app._('page_count_suffix', self.total_pages))
+        self.prev_button.configure(state='normal' if self.current_page > 1 else 'disabled')
+        self.next_button.configure(state='normal' if self.current_page < self.total_pages else 'disabled')
+
+    def change_page(self, delta):
+        page = max(1, min(self.total_pages, self.current_page + delta))
+        if page != self.current_page:
+            self.current_page = page
+            self.canvas.yview_moveto(0)
+            self.reload()
+
+    def on_goto_page(self, _=None):
+        try:
+            page = int(self.page_number.get())
+        except ValueError:
+            self.update_page_controls()
+            return
+        self.current_page = max(1, min(self.total_pages, page))
+        self.canvas.yview_moveto(0)
+        self.reload()
+
+    def delete_selected_images(self):
+        if self.selected_paths:
+            paths = sorted(self.selected_paths)
+            self.app.request_recycle(paths, self.app._('cleanup_reason_selected', len(paths)), parent=self.top)
+
+    def delete_image(self):
+        if self.clicked_image_path:
+            self.app.request_recycle([self.clicked_image_path], self.app._('cleanup_reason_selected', 1), parent=self.top)
+
+    def remove_recycled(self, paths):
+        self.selected_paths.difference_update(paths)
+        if self.custom_paths is not None:
+            removed = set(map(path_key, paths))
+            self.custom_paths = tuple(path for path in self.custom_paths if path_key(path) not in removed)
+        self.reload()
 
     def open_image(self):
         if self.clicked_image_path:
-            try:
-                os.startfile(self.clicked_image_path)
-            except AttributeError:
-                import subprocess
-                opener = "open" if sys.platform == "darwin" else "xdg-open"
-                subprocess.call([opener, self.clicked_image_path])
+            self.app.open_path(self.clicked_image_path)
 
     def open_image_directory(self):
         if self.clicked_image_path:
-            try:
-                os.startfile(os.path.dirname(self.clicked_image_path))
-            except AttributeError:
-                import subprocess
-                opener = "open" if sys.platform == "darwin" else "xdg-open"
-                subprocess.call([opener, os.path.dirname(self.clicked_image_path)])
+            self.app.open_path(os.path.dirname(self.clicked_image_path))
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.generation += 1
+        self.photos.clear()
+        if self in self.app.viewers:
+            self.app.viewers.remove(self)
+        self.top.destroy()

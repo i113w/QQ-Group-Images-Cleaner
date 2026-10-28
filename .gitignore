@@ -4,3 +4,11 @@ lib/__pycache__
 !/qq_group_images_cleaner.py
 /*.md
 !/README.md
+
+# Local snapshots and persistent indexes
+bak/
+.qq-cleaner/
+__pycache__/
+*.pyc
+
+assets/

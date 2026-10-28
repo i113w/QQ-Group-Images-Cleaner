@@ -1,141 +1,165 @@
+"""Review the exact immutable file plan before granting recycling approval."""
+
+import math
 import os
-import random
-import threading
-from tkinter import ttk, Frame, Label, Scrollbar, Canvas, Toplevel
-from lib.ToolTip import ToolTip
+import time
+from tkinter import BooleanVar, Frame, Label, Toplevel, ttk
+
+from lib.file_metadata import IMAGE_EXTENSIONS, format_size
 from lib.ImportCheck import import_PIL
+from lib.safe_recycle import RecycleApproval
+from lib.theme import BG, CARD, MUTED
 
 Image, ImageTk = import_PIL()
 
 
 class ConfirmationDialog:
-    """A custom dialog to confirm deletion with image previews."""
+    PAGE_SIZE = 100
 
-    def __init__(self, parent, app, year, month, image_paths, custom_message=None):
-        self.parent = parent
-        self.app = app
+    def __init__(self, parent, app, plan, manifest):
+        self.parent, self.app, self.plan, self.manifest = parent, app, plan, manifest
+        self.approval = None
         self.confirmed = False
-        self.loading_label = None
-
-        self.top = Toplevel(parent)
-        self.top.title(self.app._('confirm_delete_title'))
+        self.closed = False
+        self.page = 1
+        self.photos = []
+        self.acknowledged = BooleanVar(parent, value=False)
+        self.top = Toplevel(parent, background=BG)
+        self.top.title(app._('confirm_delete_title'))
+        self.top.geometry('900x730')
+        self.top.minsize(840, 650)
         self.top.transient(parent)
         self.top.grab_set()
-
-        # --- Message ---
-        # Fix #8: unified positional-arg call for both languages
-        if custom_message:
-            msg = custom_message
+        self.top.protocol('WM_DELETE_WINDOW', self.cancel)
+        self.top.bind('<Destroy>', self._destroyed, add='+')
+        self.top.bind('<Escape>', lambda _: self.cancel())
+        self.top.columnconfigure(0, weight=1)
+        self.top.rowconfigure(3, weight=1)
+        header = ttk.Frame(self.top, padding=(22, 18, 22, 8))
+        header.grid(row=0, column=0, sticky='ew')
+        ttk.Label(header, text=app._('plan_summary', len(plan.targets), format_size(plan.total_size)),
+                  style='Title.TLabel').pack(anchor='w')
+        ttk.Label(header, text=plan.reason, wraplength=820).pack(anchor='w', pady=(8, 0))
+        ttk.Label(header, text=app._('plan_root', plan.root), style='Muted.TLabel', wraplength=820).pack(anchor='w', pady=(6, 0))
+        ttk.Label(header, text=app._('plan_impact'), style='Muted.TLabel', wraplength=820).pack(anchor='w', pady=(8, 0))
+        titlebar = ttk.Frame(self.top, padding=(22, 6))
+        titlebar.grid(row=1, column=0, sticky='ew')
+        ttk.Label(titlebar, text=app._('plan_paths')).pack(side='left')
+        ttk.Button(titlebar, text=app._('plan_manifest'), command=lambda: app.open_path(str(manifest))).pack(side='right')
+        self.thumbs = Frame(self.top, background=BG, height=110)
+        self.thumbs.grid(row=2, column=0, sticky='ew', padx=22, pady=(0, 10))
+        self.thumbs.grid_propagate(False)
+        self.loading_label = Label(self.thumbs, text=app._('loading_thumbnails'), background=BG, foreground=MUTED)
+        self.loading_label.place(relx=.5, rely=.5, anchor='center')
+        table_frame = ttk.Frame(self.top, style='Card.TFrame')
+        table_frame.grid(row=3, column=0, sticky='nsew', padx=22)
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        self.tree = ttk.Treeview(table_frame, columns=('name', 'date', 'size', 'path'), show='headings')
+        self.tree.heading('name', text=app._('file_name'))
+        self.tree.heading('date', text=app._('file_date'))
+        self.tree.heading('path', text=app._('file_path'))
+        self.tree.heading('size', text=app._('file_size'))
+        self.tree.column('name', width=150, stretch=False)
+        self.tree.column('date', width=100, stretch=False)
+        self.tree.column('path', width=510, minwidth=300, stretch=True)
+        self.tree.column('size', width=90, anchor='e', stretch=False)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        scroll = ttk.Scrollbar(table_frame, orient='vertical', command=self.tree.yview)
+        scroll.grid(row=0, column=1, sticky='ns')
+        self.tree.configure(yscrollcommand=scroll.set)
+        horizontal = ttk.Scrollbar(table_frame, orient='horizontal', command=self.tree.xview)
+        horizontal.grid(row=1, column=0, sticky='ew')
+        self.tree.configure(xscrollcommand=horizontal.set)
+        pages = ttk.Frame(self.top, padding=(22, 8))
+        pages.grid(row=4, column=0, sticky='ew')
+        self.page_label = ttk.Label(pages, style='Muted.TLabel')
+        self.page_label.pack(side='left')
+        self.next_button = ttk.Button(pages, text=app._('next_page'), command=lambda: self.change_page(1))
+        self.next_button.pack(side='right')
+        self.prev_button = ttk.Button(pages, text=app._('prev_page'), command=lambda: self.change_page(-1))
+        self.prev_button.pack(side='right', padx=8)
+        footer = ttk.Frame(self.top, padding=(22, 4, 22, 18))
+        footer.grid(row=5, column=0, sticky='ew')
+        self.ack = ttk.Checkbutton(footer, text=app._('plan_ack'), variable=self.acknowledged,
+                                   command=self._approval_changed)
+        self.ack.pack(anchor='w', pady=(0, 12))
+        self.confirm_button = ttk.Button(footer, text=app._('confirm_btn'), style='Recycle.TButton',
+                                          command=self.confirm, state='disabled')
+        self.confirm_button.pack(side='right')
+        self.cancel_button = ttk.Button(footer, text=app._('cancel_btn'), command=self.cancel)
+        self.cancel_button.pack(side='right', padx=10)
+        self.cancel_button.focus_set()
+        self.show_page()
+        paths = [target.path for target in plan.targets
+                 if os.path.splitext(target.path)[1].lower() in IMAGE_EXTENSIONS][:6]
+        if paths:
+            app.run_background(lambda: self._decode(paths), self._show_thumbnails)
         else:
-            msg = self.app._('confirm_delete_msg', year, month)
-        Label(self.top, text=msg, justify='left', padx=10, pady=10).pack()
+            self.loading_label.configure(text='')
 
-        # --- Thumbnails Frame ---
-        thumb_frame = Frame(self.top, bd=2, relief='sunken')
-        thumb_frame.pack(padx=10, pady=10, fill='both', expand=True)
-        self.canvas = Canvas(thumb_frame, width=480, height=250)
-
-        scrollbar = Scrollbar(thumb_frame, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = Frame(self.canvas)
-
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        self.photo_references = []
-
-        # --- Loading indicator (removed when first thumbnail arrives) ---
-        self.loading_label = Label(self.scrollable_frame,
-                                   text=self.app._('loading_thumbnails'))
-        self.loading_label.pack(pady=20)
-
-        # --- Fix #9: load thumbnails asynchronously in a background thread ---
-        self.load_thumbnails(image_paths)
-
-        # --- Buttons ---
-        button_frame = Frame(self.top, pady=5)
-        button_frame.pack()
-        ttk.Button(button_frame, text=self.app._('cancel_btn'),
-                   command=self.cancel).pack(side='right', padx=10)
-        ttk.Button(button_frame, text=self.app._('confirm_btn'),
-                   command=self.confirm).pack(side='right')
-
-    # ---------------------------------------------------- async thumbnail loading
-    def load_thumbnails(self, image_paths):
-        """Select a random sample and start asynchronous loading."""
-        sample_size = 20
-        paths_to_show = (random.sample(image_paths, min(len(image_paths), sample_size))
-                         if image_paths else [])
-
-        if not paths_to_show:
-            if self.loading_label:
-                self.loading_label.destroy()
-                self.loading_label = None
-            return
-
-        threading.Thread(target=self._load_thumbnails_thread,
-                         args=(paths_to_show,), daemon=True).start()
-
-    def _load_thumbnails_thread(self, paths):
-        """Decode thumbnail PIL images in a background thread.
-
-        Only ``Image.open()`` / ``thumbnail()`` are called here.
-        ``ImageTk.PhotoImage`` instantiation is deferred to the main
-        thread via ``after()`` to keep Tkinter thread-safe (Fix #4 / #9).
-        """
-        for i, path in enumerate(paths):
+    @staticmethod
+    def _decode(paths):
+        images = []
+        for path in paths:
             try:
-                image = Image.open(path)
-                image.thumbnail((100, 100))
-                # Send the PIL Image to the main thread
-                self.top.after(0, self._add_thumbnail_to_ui, i, path, image)
-            except Exception as e:
-                print(f"Could not load thumbnail for {path}: {e}")
-
-    def _add_thumbnail_to_ui(self, index, path, pil_image):
-        """Create PhotoImage and place it on the canvas — main thread only."""
-        if not self.top.winfo_exists():
-            try:
-                pil_image.close()
-            except Exception:
+                with Image.open(path) as source:
+                    source.thumbnail((110, 95))
+                    images.append(source.copy())
+            except (OSError, ValueError, Image.DecompressionBombError):
                 pass
-            return
+        return images
 
-        # Remove loading indicator on first successful thumbnail
-        if self.loading_label:
+    def _show_thumbnails(self, images):
+        if not self.closed:
             self.loading_label.destroy()
-            self.loading_label = None
+            for index, pil_image in enumerate(images):
+                photo = ImageTk.PhotoImage(pil_image, master=self.top)
+                self.photos.append(photo)
+                Label(self.thumbs, image=photo, background=CARD, padx=6, pady=4).grid(row=0, column=index, padx=5)
+            if not images:
+                Label(self.thumbs, text=self.app._('image_unavailable'), background=BG, foreground=MUTED).grid(row=0, column=0)
+        for image in images:
+            image.close()
 
-        try:
-            photo = ImageTk.PhotoImage(pil_image)
-            self.photo_references.append(photo)
+    def show_page(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        targets = self.plan.targets[(self.page - 1) * self.PAGE_SIZE:self.page * self.PAGE_SIZE]
+        for target in targets:
+            self.tree.insert('', 'end', values=(os.path.basename(target.path),
+                time.strftime('%Y-%m-%d', time.localtime(target.real_time)), format_size(target.size), target.path))
+        pages = max(1, math.ceil(len(self.plan.targets) / self.PAGE_SIZE))
+        self.page_label.configure(text=self.app._('plan_page', self.page, pages))
+        self.prev_button.configure(state='normal' if self.page > 1 else 'disabled')
+        self.next_button.configure(state='normal' if self.page < pages else 'disabled')
 
-            row, col = divmod(index, 4)
-            item_frame = Frame(self.scrollable_frame)
-            item_frame.grid(row=row, column=col, padx=5, pady=5)
+    def change_page(self, delta):
+        pages = max(1, math.ceil(len(self.plan.targets) / self.PAGE_SIZE))
+        self.page = max(1, min(pages, self.page + delta))
+        self.show_page()
 
-            img_label = Label(item_frame, image=photo)
-            img_label.pack()
+    def _approval_changed(self):
+        self.confirm_button.configure(state='normal' if self.acknowledged.get() else 'disabled')
 
-            ToolTip(img_label, os.path.basename(path))
-        except Exception as e:
-            print(f"Error creating thumbnail UI for {path}: {e}")
-        finally:
-            try:
-                pil_image.close()
-            except Exception:
-                pass
-
-    # ---------------------------------------------------- dialog actions
     def confirm(self):
+        if not self.acknowledged.get():
+            return
+        self.approval = RecycleApproval(self.plan.id, self.plan.digest)
         self.confirmed = True
-        self.top.destroy()
+        self._close()
 
     def cancel(self):
+        self.approval = None
         self.confirmed = False
+        self._close()
+
+    def _close(self):
+        self.closed = True
+        self.photos.clear()
+        self.top.grab_release()
         self.top.destroy()
+
+    def _destroyed(self, event):
+        if event.widget is self.top:
+            self.closed = True
